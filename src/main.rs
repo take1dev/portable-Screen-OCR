@@ -5,6 +5,7 @@ mod preprocessing;
 mod ocr;
 mod clipboard;
 mod notification;
+mod config;
 
 use eframe::egui;
 use global_hotkey::{
@@ -52,6 +53,9 @@ pub struct ScreenOcrApp {
     tray_icon: Option<TrayIcon>,
     _hotkey_manager: GlobalHotKeyManager,
     overlay_active: Arc<AtomicBool>,
+    show_settings: Arc<AtomicBool>,
+    was_settings_open: bool,
+    config: config::AppConfig,
     hwnd: Option<*mut std::ffi::c_void>,
     
     // Selection state
@@ -69,12 +73,16 @@ unsafe impl Sync for ScreenOcrApp {}
 
 impl ScreenOcrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let config = config::AppConfig::load();
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
-        hotkey_manager.register(hotkey).unwrap();
+        let hotkey = HotKey::new(config.get_modifiers(), config.get_code());
+        let _ = hotkey_manager.register(hotkey);
 
         let overlay_active = Arc::new(AtomicBool::new(false));
         let overlay_active_clone = overlay_active.clone();
+        
+        let show_settings = Arc::new(AtomicBool::new(false));
+        let show_settings_clone = show_settings.clone();
 
         // Background thread: handles hotkey + tray exit events
         let ctx = cc.egui_ctx.clone();
@@ -84,6 +92,9 @@ impl ScreenOcrApp {
                 if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if event.id() == &tray_icon::menu::MenuId::new("exit") {
                         std::process::exit(0);
+                    } else if event.id() == &tray_icon::menu::MenuId::new("change_shortcut") {
+                        show_settings_clone.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
                     }
                 }
 
@@ -106,6 +117,9 @@ impl ScreenOcrApp {
             tray_icon: None,
             _hotkey_manager: hotkey_manager,
             overlay_active,
+            show_settings,
+            was_settings_open: false,
+            config,
             hwnd: None,
             start_pos: None,
             current_pos: None,
@@ -125,8 +139,9 @@ impl eframe::App for ScreenOcrApp {
         // Initialize tray icon on first frame
         if self.tray_icon.is_none() {
             let tray_menu = Menu::new();
+            let change_shortcut_i = MenuItem::with_id("change_shortcut", "Change Shortcut", true, None);
             let quit_i = MenuItem::with_id("exit", "Exit", true, None);
-            tray_menu.append_items(&[&quit_i]).unwrap();
+            tray_menu.append_items(&[&change_shortcut_i, &quit_i]).unwrap();
 
             let icon_bytes = include_bytes!("../assets/icon.png");
             let (icon_rgba, icon_width, icon_height) = {
@@ -163,8 +178,58 @@ impl eframe::App for ScreenOcrApp {
                 }
             }
         }
+        let is_settings = self.show_settings.load(Ordering::Relaxed);
+        if is_settings {
+            if !self.was_settings_open {
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = self.hwnd { unsafe { win32::set_click_through(hwnd, false); } }
+                self.was_settings_open = true;
+            }
 
-        let is_active = self.overlay_active.load(Ordering::Relaxed);
+            egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
+                ui.heading("Global Hotkey Configuration");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.config.modifier_ctrl, "Ctrl");
+                    ui.checkbox(&mut self.config.modifier_shift, "Shift");
+                    ui.checkbox(&mut self.config.modifier_alt, "Alt");
+                    ui.checkbox(&mut self.config.modifier_meta, "Win");
+                });
+                
+                egui::ComboBox::from_label("Key").selected_text(&self.config.key).show_ui(ui, |ui| {
+                    let keys = [
+                        "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ",
+                        "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9",
+                        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
+                    ];
+                    for k in keys {
+                        ui.selectable_value(&mut self.config.key, k.to_string(), k);
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.config.save();
+                        let _ = self._hotkey_manager.unregister_all(&[]);
+                        let hk = HotKey::new(self.config.get_modifiers(), self.config.get_code());
+                        let _ = self._hotkey_manager.register(hk);
+                        self.show_settings.store(false, Ordering::Relaxed);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        // Reload from disk to discard changes
+                        self.config = config::AppConfig::load();
+                        self.show_settings.store(false, Ordering::Relaxed);
+                    }
+                });
+            });
+            ctx.request_repaint();
+        } else if self.was_settings_open {
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = self.hwnd { unsafe { win32::set_click_through(hwnd, true); } }
+            self.was_settings_open = false;
+        }
+
+        let is_active = self.overlay_active.load(Ordering::Relaxed) && !is_settings;
 
         // Transition: became active
         if is_active && self.start_pos.is_none() && self.current_pos.is_none() {
