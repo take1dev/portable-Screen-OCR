@@ -32,22 +32,25 @@ pub struct ScreenOcrApp {
     window_offset_y: i32,
 }
 
-impl Default for ScreenOcrApp {
-    fn default() -> Self {
+impl ScreenOcrApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
         
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
         hotkey_manager.register(hotkey).unwrap();
 
-        // Background thread to ensure the Exit button ALWAYS works even if eframe pauses the update loop
-        // when the window is hidden.
+        // Background thread to constantly wake up eframe.
+        // Because the window is hidden, eframe goes to sleep and stops listening to hotkey/tray events.
+        let ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             loop {
+                // Also check for Exit just in case winit event loop is hard-blocked
                 if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if event.id() == &tray_icon::menu::MenuId::new("exit") {
                         std::process::exit(0);
                     }
                 }
+                ctx.request_repaint();
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
@@ -261,6 +264,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Screen OCR",
         options,
-        Box::new(|_cc| Ok(Box::new(ScreenOcrApp::default()))),
+        Box::new(|cc| Ok(Box::new(ScreenOcrApp::new(cc)))),
     )
 }
