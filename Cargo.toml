@@ -1,0 +1,46 @@
+[package]
+name = "screen-ocr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI
+eframe = { version = "0.31", features = ["persistence"] }
+egui = "0.31"
+
+# System Tray & Menu
+tray-icon = "0.19"
+
+# Global Hotkey
+global-hotkey = "0.6"
+
+# Screen Capture
+xcap = "0.0.14"
+
+# Image Processing
+image = "0.25"
+imageproc = "0.25"
+
+# Zip extraction for bundled Tesseract
+zip = "0.6"
+
+# OCR
+# Removed tesseract to use std::process::Command instead
+
+# Clipboard
+arboard = "3"
+
+# Notifications (Windows)
+winrt-notification = "0.5"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
