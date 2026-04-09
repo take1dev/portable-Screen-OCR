@@ -20,6 +20,7 @@ use std::thread;
 pub struct ScreenOcrApp {
     tray_icon: Option<TrayIcon>,
     hotkey_manager: GlobalHotKeyManager,
+    show_overlay_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     overlay_visible: bool,
     exit: bool,
     
@@ -39,8 +40,10 @@ impl ScreenOcrApp {
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
         hotkey_manager.register(hotkey).unwrap();
 
-        // Background thread to constantly wake up eframe.
-        // Because the window is hidden, eframe goes to sleep and stops listening to hotkey/tray events.
+        let show_overlay_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let show_overlay_requested_clone = show_overlay_requested.clone();
+        
+        // Background thread to handle Hotkey and Tray Events irrespective of eframe's hidden state sleep.
         let ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             loop {
@@ -50,7 +53,16 @@ impl ScreenOcrApp {
                         std::process::exit(0);
                     }
                 }
-                ctx.request_repaint();
+                
+                while let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
+                    if event.state == global_hotkey::HotKeyState::Released {
+                        let current = show_overlay_requested_clone.load(std::sync::atomic::Ordering::Relaxed);
+                        let is_visible = !current;
+                        show_overlay_requested_clone.store(is_visible, std::sync::atomic::Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(is_visible));
+                    }
+                }
+
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
@@ -58,6 +70,7 @@ impl ScreenOcrApp {
         Self {
             tray_icon: None,
             hotkey_manager,
+            show_overlay_requested,
             overlay_visible: false,
             exit: false,
             start_pos: None,
@@ -107,44 +120,42 @@ impl eframe::App for ScreenOcrApp {
             println!("Tray event: {:?}", event);
         }
 
+        // Sync our local state with the requested state from the background thread
+        let requested = self.show_overlay_requested.load(std::sync::atomic::Ordering::Relaxed);
+        if requested != self.overlay_visible {
+            self.overlay_visible = requested;
+            
+            if self.overlay_visible {
+                // We just became visible! Resize the window to cover all monitors.
+                if let Ok(monitors) = xcap::Monitor::all() {
+                    let mut min_x = i32::MAX;
+                    let mut min_y = i32::MAX;
+                    let mut max_x = i32::MIN;
+                    let mut max_y = i32::MIN;
 
+                    for m in monitors {
+                        min_x = min_x.min(m.x());
+                        min_y = min_y.min(m.y());
+                        max_x = max_x.max(m.x() + m.width() as i32);
+                        max_y = max_y.max(m.y() + m.height() as i32);
+                    }
 
-        // Handle Hotkey Events
-        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.state == global_hotkey::HotKeyState::Released {
-                self.overlay_visible = !self.overlay_visible;
-                
-                if self.overlay_visible {
-                    if let Ok(monitors) = xcap::Monitor::all() {
-                        let mut min_x = i32::MAX;
-                        let mut min_y = i32::MAX;
-                        let mut max_x = i32::MIN;
-                        let mut max_y = i32::MIN;
+                    if min_x < i32::MAX {
+                        self.window_offset_x = min_x;
+                        self.window_offset_y = min_y;
 
-                        for m in monitors {
-                            min_x = min_x.min(m.x());
-                            min_y = min_y.min(m.y());
-                            max_x = max_x.max(m.x() + m.width() as i32);
-                            max_y = max_y.max(m.y() + m.height() as i32);
-                        }
+                        let scale = ctx.pixels_per_point();
+                        let logical_x = min_x as f32 / scale;
+                        let logical_y = min_y as f32 / scale;
+                        let logical_w = (max_x - min_x) as f32 / scale;
+                        let logical_h = (max_y - min_y) as f32 / scale;
 
-                        if min_x < i32::MAX {
-                            self.window_offset_x = min_x;
-                            self.window_offset_y = min_y;
-
-                            let scale = ctx.pixels_per_point();
-                            let logical_x = min_x as f32 / scale;
-                            let logical_y = min_y as f32 / scale;
-                            let logical_w = (max_x - min_x) as f32 / scale;
-                            let logical_h = (max_y - min_y) as f32 / scale;
-
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
-                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
                     }
                 }
-
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.overlay_visible));
+            } else {
+                // We just became invisible, reset state
                 self.start_pos = None;
                 self.current_pos = None;
             }
@@ -153,6 +164,7 @@ impl eframe::App for ScreenOcrApp {
         // Allow user to cancel overlay with Escape or Right Click
         if self.overlay_visible {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
+                self.show_overlay_requested.store(false, std::sync::atomic::Ordering::Relaxed);
                 self.overlay_visible = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.start_pos = None;
@@ -225,6 +237,7 @@ impl eframe::App for ScreenOcrApp {
                 let p2 = self.current_pos.unwrap();
                 let selection_rect = egui::Rect::from_two_pos(p1, p2);
 
+                self.show_overlay_requested.store(false, std::sync::atomic::Ordering::Relaxed);
                 self.overlay_visible = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 
