@@ -43,11 +43,9 @@ impl ScreenOcrApp {
         let show_overlay_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let show_overlay_requested_clone = show_overlay_requested.clone();
         
-        // Background thread to handle Hotkey and Tray Events irrespective of eframe's hidden state sleep.
         let ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             loop {
-                // Also check for Exit just in case winit event loop is hard-blocked
                 if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if event.id() == &tray_icon::menu::MenuId::new("exit") {
                         std::process::exit(0);
