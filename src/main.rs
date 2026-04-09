@@ -39,6 +39,19 @@ impl Default for ScreenOcrApp {
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
         hotkey_manager.register(hotkey).unwrap();
 
+        // Background thread to ensure the Exit button ALWAYS works even if eframe pauses the update loop
+        // when the window is hidden.
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                    if event.id() == &tray_icon::menu::MenuId::new("exit") {
+                        std::process::exit(0);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
         Self {
             tray_icon: None,
             hotkey_manager,
@@ -91,12 +104,7 @@ impl eframe::App for ScreenOcrApp {
             println!("Tray event: {:?}", event);
         }
 
-        // Handle Menu Events
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id() == &tray_icon::menu::MenuId::new("exit") {
-                std::process::exit(0);
-            }
-        }
+
 
         // Handle Hotkey Events
         if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
