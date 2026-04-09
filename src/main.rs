@@ -9,69 +9,104 @@ mod notification;
 use eframe::egui;
 use global_hotkey::{
     hotkey::{Code, Modifiers, HotKey},
-    GlobalHotKeyEvent, GlobalHotKeyManager,
+    GlobalHotKeyManager,
 };
 use tray_icon::{
     menu::{Menu, MenuItem},
-    Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    Icon, TrayIcon, TrayIconBuilder,
 };
-use std::thread;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+// Win32 imports for click-through toggling
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::c_void;
+    pub type HWND = *mut c_void;
+    pub type LONG = i32;
+    pub const GWL_EXSTYLE: i32 = -20;
+    pub const WS_EX_TRANSPARENT: u32 = 0x00000020;
+    pub const WS_EX_LAYERED: u32 = 0x00080000;
+    pub const WS_EX_NOACTIVATE: u32 = 0x08000000;
+
+    extern "system" {
+        pub fn GetWindowLongW(hwnd: HWND, n_index: i32) -> LONG;
+        pub fn SetWindowLongW(hwnd: HWND, n_index: i32, dw_new_long: LONG) -> LONG;
+        pub fn SetForegroundWindow(hwnd: HWND) -> i32;
+    }
+
+    pub unsafe fn set_click_through(hwnd: HWND, enabled: bool) {
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let new_style = if enabled {
+            style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE
+        } else {
+            (style & !(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)) | WS_EX_LAYERED
+        };
+        SetWindowLongW(hwnd, GWL_EXSTYLE, new_style as i32);
+        if !enabled {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
 
 pub struct ScreenOcrApp {
     tray_icon: Option<TrayIcon>,
-    hotkey_manager: GlobalHotKeyManager,
-    show_overlay_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    overlay_visible: bool,
-    exit: bool,
+    _hotkey_manager: GlobalHotKeyManager,
+    overlay_active: Arc<AtomicBool>,
+    hwnd: Option<*mut std::ffi::c_void>,
     
     // Selection state
     start_pos: Option<egui::Pos2>,
     current_pos: Option<egui::Pos2>,
     
-    // Position of the overlay spanning all monitors
+    // Position offset spanning all monitors
     window_offset_x: i32,
     window_offset_y: i32,
 }
 
+// SAFETY: we only access hwnd from the main thread
+unsafe impl Send for ScreenOcrApp {}
+unsafe impl Sync for ScreenOcrApp {}
+
 impl ScreenOcrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-        
         let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyX);
         hotkey_manager.register(hotkey).unwrap();
 
-        let show_overlay_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let show_overlay_requested_clone = show_overlay_requested.clone();
-        
+        let overlay_active = Arc::new(AtomicBool::new(false));
+        let overlay_active_clone = overlay_active.clone();
+
+        // Background thread: handles hotkey + tray exit events
         let ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             loop {
+                // Handle tray exit
                 if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if event.id() == &tray_icon::menu::MenuId::new("exit") {
                         std::process::exit(0);
                     }
                 }
-                
+
+                // Handle hotkey - only toggle on if overlay is off
                 while let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
                     if event.state == global_hotkey::HotKeyState::Released {
-                        let current = show_overlay_requested_clone.load(std::sync::atomic::Ordering::Relaxed);
-                        let is_visible = !current;
-                        show_overlay_requested_clone.store(is_visible, std::sync::atomic::Ordering::Relaxed);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(is_visible));
-                        ctx.request_repaint(); // CRITICAL: Force eframe to actually process the Viewport command!
+                        // Only show if not already active
+                        if !overlay_active_clone.load(Ordering::Relaxed) {
+                            overlay_active_clone.store(true, Ordering::Relaxed);
+                            ctx.request_repaint();
+                        }
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(16));
             }
         });
 
         Self {
             tray_icon: None,
-            hotkey_manager,
-            show_overlay_requested,
-            overlay_visible: false,
-            exit: false,
+            _hotkey_manager: hotkey_manager,
+            overlay_active,
+            hwnd: None,
             start_pos: None,
             current_pos: None,
             window_offset_x: 0,
@@ -82,11 +117,11 @@ impl ScreenOcrApp {
 
 impl eframe::App for ScreenOcrApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Essential to make the main window transparent!
+        // Always fully transparent background
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Initialize tray icon on first frame
         if self.tray_icon.is_none() {
             let tray_menu = Menu::new();
@@ -99,132 +134,135 @@ impl eframe::App for ScreenOcrApp {
                     .expect("Failed to load icon")
                     .into_rgba8();
                 let (width, height) = image.dimensions();
-                let rgba = image.into_raw();
-                (rgba, width, height)
+                (image.into_raw(), width, height)
             };
             let icon = Icon::from_rgba(icon_rgba, icon_width, icon_height).unwrap();
 
-            let tray_icon = TrayIconBuilder::new()
-                .with_menu(Box::new(tray_menu))
-                .with_tooltip("Screen OCR")
-                .with_icon(icon)
-                .build()
-                .unwrap();
+            self.tray_icon = Some(
+                TrayIconBuilder::new()
+                    .with_menu(Box::new(tray_menu))
+                    .with_tooltip("Screen OCR")
+                    .with_icon(icon)
+                    .build()
+                    .unwrap(),
+            );
 
-            self.tray_icon = Some(tray_icon);
-        }
-
-        // Handle Tray Events
-        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            println!("Tray event: {:?}", event);
-        }
-
-        // Sync our local state with the requested state from the background thread
-        let requested = self.show_overlay_requested.load(std::sync::atomic::Ordering::Relaxed);
-        if requested != self.overlay_visible {
-            self.overlay_visible = requested;
-            
-            if self.overlay_visible {
-                // We just became visible! Resize the window to cover all monitors.
-                if let Ok(monitors) = xcap::Monitor::all() {
-                    let mut min_x = i32::MAX;
-                    let mut min_y = i32::MAX;
-                    let mut max_x = i32::MIN;
-                    let mut max_y = i32::MIN;
-
-                    for m in monitors {
-                        min_x = min_x.min(m.x());
-                        min_y = min_y.min(m.y());
-                        max_x = max_x.max(m.x() + m.width() as i32);
-                        max_y = max_y.max(m.y() + m.height() as i32);
-                    }
-
-                    if min_x < i32::MAX {
-                        self.window_offset_x = min_x;
-                        self.window_offset_y = min_y;
-
-                        let scale = ctx.pixels_per_point();
-                        let logical_x = min_x as f32 / scale;
-                        let logical_y = min_y as f32 / scale;
-                        let logical_w = (max_x - min_x) as f32 / scale;
-                        let logical_h = (max_y - min_y) as f32 / scale;
-
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
+            // Get and store the HWND for click-through toggling
+            #[cfg(target_os = "windows")]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(wh) = frame.window_handle() {
+                    if let RawWindowHandle::Win32(h) = wh.window_handle().unwrap().as_raw() {
+                        self.hwnd = Some(h.hwnd.get() as *mut _);
                     }
                 }
-            } else {
-                // We just became invisible, reset state
-                self.start_pos = None;
-                self.current_pos = None;
+
+                // Start fully click-through (invisible to input)
+                if let Some(hwnd) = self.hwnd {
+                    unsafe { win32::set_click_through(hwnd, true); }
+                }
             }
         }
 
-        // Allow user to cancel overlay with Escape or Right Click
-        if self.overlay_visible {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
-                self.show_overlay_requested.store(false, std::sync::atomic::Ordering::Relaxed);
-                self.overlay_visible = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.start_pos = None;
-                self.current_pos = None;
+        let is_active = self.overlay_active.load(Ordering::Relaxed);
+
+        // Transition: became active
+        if is_active && self.start_pos.is_none() && self.current_pos.is_none() {
+            // Resize to span all monitors if not already done
+            if let Ok(monitors) = xcap::Monitor::all() {
+                let mut min_x = i32::MAX;
+                let mut min_y = i32::MAX;
+                let mut max_x = i32::MIN;
+                let mut max_y = i32::MIN;
+
+                for m in &monitors {
+                    min_x = min_x.min(m.x());
+                    min_y = min_y.min(m.y());
+                    max_x = max_x.max(m.x() + m.width() as i32);
+                    max_y = max_y.max(m.y() + m.height() as i32);
+                }
+
+                if min_x < i32::MAX {
+                    self.window_offset_x = min_x;
+                    self.window_offset_y = min_y;
+                    let scale = ctx.pixels_per_point();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        min_x as f32 / scale,
+                        min_y as f32 / scale,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        (max_x - min_x) as f32 / scale,
+                        (max_y - min_y) as f32 / scale,
+                    )));
+                }
+            }
+
+            // Disable click-through so we can receive mouse input
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = self.hwnd {
+                unsafe { win32::set_click_through(hwnd, false); }
             }
         }
 
-
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-
-        if self.overlay_visible {
+        if is_active {
             let screen_rect = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("overlay")));
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("overlay"),
+            ));
 
+            // Cancel on Escape or right-click
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
+                self.overlay_active.store(false, Ordering::Relaxed);
+                self.start_pos = None;
+                self.current_pos = None;
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = self.hwnd {
+                    unsafe { win32::set_click_through(hwnd, true); }
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            // Draw dim overlay
             match (self.start_pos, self.current_pos) {
                 (Some(p1), Some(p2)) => {
                     let selection_rect = egui::Rect::from_two_pos(p1, p2);
-                    let color = egui::Color32::from_black_alpha(128); // Semi-transparent black
-
+                    let dim = egui::Color32::from_black_alpha(160);
                     // Top
                     painter.rect_filled(
-                        egui::Rect::from_min_max(screen_rect.min, egui::Pos2::new(screen_rect.max.x, selection_rect.min.y)),
-                        0.0,
-                        color,
+                        egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, selection_rect.min.y)),
+                        0.0, dim,
                     );
                     // Bottom
                     painter.rect_filled(
-                        egui::Rect::from_min_max(egui::Pos2::new(screen_rect.min.x, selection_rect.max.y), screen_rect.max),
-                        0.0,
-                        color,
+                        egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.max.y), screen_rect.max),
+                        0.0, dim,
                     );
                     // Left
                     painter.rect_filled(
-                        egui::Rect::from_min_max(egui::Pos2::new(screen_rect.min.x, selection_rect.min.y), egui::Pos2::new(selection_rect.min.x, selection_rect.max.y)),
-                        0.0,
-                        color,
+                        egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.min.y), egui::pos2(selection_rect.min.x, selection_rect.max.y)),
+                        0.0, dim,
                     );
                     // Right
                     painter.rect_filled(
-                        egui::Rect::from_min_max(egui::Pos2::new(selection_rect.max.x, selection_rect.min.y), egui::Pos2::new(screen_rect.max.x, selection_rect.max.y)),
-                        0.0,
-                        color,
+                        egui::Rect::from_min_max(egui::pos2(selection_rect.max.x, selection_rect.min.y), egui::pos2(screen_rect.max.x, selection_rect.max.y)),
+                        0.0, dim,
                     );
-                    
-                    // Draw a thin red border around selection
                     painter.rect_stroke(
                         selection_rect,
                         0.0,
-                        egui::Stroke::new(1.0, egui::Color32::RED),
-                        egui::StrokeKind::Inside,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 180, 255)),
+                        egui::StrokeKind::Outside,
                     );
                 }
                 _ => {
-                    // Full screen dark mode before selection starts
-                    painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
+                    painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(160));
                 }
             }
 
-            let pointer = &ctx.input(|i| i.pointer.clone());
-            
+            // Handle mouse input
+            let pointer = ctx.input(|i| i.pointer.clone());
             if pointer.primary_pressed() {
                 self.start_pos = pointer.interact_pos();
             }
@@ -236,36 +274,63 @@ impl eframe::App for ScreenOcrApp {
                 let p2 = self.current_pos.unwrap();
                 let selection_rect = egui::Rect::from_two_pos(p1, p2);
 
-                self.show_overlay_requested.store(false, std::sync::atomic::Ordering::Relaxed);
-                self.overlay_visible = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                
+                self.overlay_active.store(false, Ordering::Relaxed);
+                self.start_pos = None;
+                self.current_pos = None;
+
+                // Re-enable click-through
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = self.hwnd {
+                    unsafe { win32::set_click_through(hwnd, true); }
+                }
+
                 let scale_factor = ctx.pixels_per_point();
                 let ox = self.window_offset_x;
                 let oy = self.window_offset_y;
-                thread::spawn(move || {
+                std::thread::spawn(move || {
                     if let Ok(image) = capture::capture_region(selection_rect, scale_factor, ox, oy) {
                         let processed = preprocessing::preprocess(image);
                         if let Ok(text) = ocr::recognize(&processed, "eng+srp_latn", 6) {
-                            if !text.is_empty() {
+                            if !text.trim().is_empty() {
                                 let _ = clipboard::copy_to_clipboard(&text);
                                 notification::notify_success();
                             }
                         }
                     }
                 });
-
-                self.start_pos = None;
-                self.current_pos = None;
             }
+
+            ctx.request_repaint();
         }
     }
 }
 
 fn main() -> eframe::Result<()> {
+    // Span all monitors
+    let (total_x, total_y, total_w, total_h) = if let Ok(monitors) = xcap::Monitor::all() {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for m in &monitors {
+            min_x = min_x.min(m.x());
+            min_y = min_y.min(m.y());
+            max_x = max_x.max(m.x() + m.width() as i32);
+            max_y = max_y.max(m.y() + m.height() as i32);
+        }
+        if min_x < i32::MAX {
+            (min_x as f32, min_y as f32, (max_x - min_x) as f32, (max_y - min_y) as f32)
+        } else {
+            (0.0, 0.0, 1920.0, 1080.0)
+        }
+    } else {
+        (0.0, 0.0, 1920.0, 1080.0)
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_visible(false)
+            .with_position(egui::pos2(total_x, total_y))
+            .with_inner_size(egui::vec2(total_w, total_h))
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()

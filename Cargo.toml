@@ -44,3 +44,4 @@ tracing-subscriber = "0.3"
 # Error handling
 anyhow = "1"
 thiserror = "2"
+raw-window-handle = "0.6.2"
