@@ -60,6 +60,7 @@ impl ScreenOcrApp {
                         let is_visible = !current;
                         show_overlay_requested_clone.store(is_visible, std::sync::atomic::Ordering::Relaxed);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(is_visible));
+                        ctx.request_repaint(); // CRITICAL: Force eframe to actually process the Viewport command!
                     }
                 }
 
