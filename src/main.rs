@@ -65,7 +65,9 @@ impl ScreenOcrApp {
         let config = config::AppConfig::load();
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
         let hotkey = HotKey::new(config.get_modifiers(), config.get_code());
-        let _ = hotkey_manager.register(hotkey);
+        if let Err(e) = hotkey_manager.register(hotkey) {
+            notification::notify_error(&format!("Failed to register hotkey. Might be mapped by another app! ({:?})", e));
+        }
 
         let overlay_active = Arc::new(AtomicBool::new(false));
         let show_settings = Arc::new(AtomicBool::new(false));
@@ -276,7 +278,9 @@ impl eframe::App for ScreenOcrApp {
                         self.config.save();
                         let _ = self._hotkey_manager.unregister_all(&[]);
                         let hk = HotKey::new(self.config.get_modifiers(), self.config.get_code());
-                        let _ = self._hotkey_manager.register(hk);
+                        if let Err(e) = self._hotkey_manager.register(hk) {
+                            notification::notify_error(&format!("Failed to register hotkey: {:?}", e));
+                        }
                         self.show_settings.store(false, Ordering::Relaxed);
                     }
                     if ui.button("Cancel").clicked() {
