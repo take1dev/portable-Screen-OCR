@@ -89,6 +89,9 @@ impl ScreenOcrApp {
                         && !overlay.load(Ordering::Relaxed)
                     {
                         overlay.store(true, Ordering::Relaxed);
+                        // Crucial: Winit suspends repaints for hidden windows!
+                        // We MUST send a viewport command to wake up the main thread's event loop.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.request_repaint();
                     }
                 }
