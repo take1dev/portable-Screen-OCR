@@ -20,53 +20,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use image::RgbaImage;
 
-// ─── Win32: hide/show the eframe window ───────────────────────────────────────
-#[cfg(target_os = "windows")]
-mod win32 {
-    use std::ffi::c_void;
-    pub type HWND = *mut c_void;
-    pub type LONG = i32;
-    pub type BOOL = i32;
-
-    pub const GWL_EXSTYLE: i32 = -20;
-    pub const WS_EX_LAYERED: u32 = 0x00080000;
-    pub const WS_EX_NOACTIVATE: u32 = 0x08000000;
-
-    pub const SW_HIDE: i32 = 0;
-
-    pub const SWP_NOMOVE: u32 = 0x0002;
-    pub const SWP_NOSIZE: u32 = 0x0001;
-    pub const SWP_NOACTIVATE: u32 = 0x0010;
-    pub const SWP_SHOWWINDOW: u32 = 0x0040;
-    pub const HWND_TOPMOST: isize = -1;
-
-    extern "system" {
-        pub fn GetWindowLongW(hwnd: HWND, n_index: i32) -> LONG;
-        pub fn SetWindowLongW(hwnd: HWND, n_index: i32, dw_new_long: LONG) -> LONG;
-        pub fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
-        pub fn SetForegroundWindow(hwnd: HWND) -> BOOL;
-        pub fn SetWindowPos(
-            hwnd: HWND, insert_after: HWND,
-            x: i32, y: i32, cx: i32, cy: i32, flags: u32,
-        ) -> BOOL;
-    }
-
-    pub unsafe fn hide_window(hwnd: HWND) {
-        ShowWindow(hwnd, SW_HIDE);
-    }
-
-    pub unsafe fn show_overlay(hwnd: HWND) {
-        let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_style = (style | WS_EX_LAYERED) & !WS_EX_NOACTIVATE;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, new_style as i32);
-        SetWindowPos(
-            hwnd, HWND_TOPMOST as *mut c_void,
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
-        );
-        SetForegroundWindow(hwnd);
-    }
-}
+// ─── Win32 is no longer needed ────────────────────────────────────────────────
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
@@ -80,7 +34,6 @@ pub struct ScreenOcrApp {
     was_active: bool,
     initialized: bool,
     config: config::AppConfig,
-    hwnd: Option<*mut std::ffi::c_void>,
 
     // ── "Capture-first" state ──
     // When the hotkey fires we capture the entire virtual desktop into this
@@ -103,7 +56,7 @@ pub struct ScreenOcrApp {
     overlay_activated_at: Option<Instant>,
 }
 
-// SAFETY: hwnd is only accessed from the main (GUI) thread.
+// ScreenOcrApp works safely across threads
 unsafe impl Send for ScreenOcrApp {}
 unsafe impl Sync for ScreenOcrApp {}
 
@@ -152,7 +105,6 @@ impl ScreenOcrApp {
             was_active: false,
             initialized: false,
             config,
-            hwnd: None,
             frozen_screenshot: None,
             frozen_texture: None,
             frozen_offset_x: 0,
@@ -168,26 +120,13 @@ impl ScreenOcrApp {
     // ── Window helpers ────────────────────────────────────────────────────
 
     fn hide_overlay(&mut self, ctx: &egui::Context) {
-        #[cfg(target_os = "windows")]
-        if let Some(hwnd) = self.hwnd {
-            unsafe { win32::hide_window(hwnd); }
-        }
-        #[cfg(not(target_os = "windows"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        let _ = ctx;
-
-        // Free the GPU texture when we hide
         self.frozen_texture = None;
     }
 
     fn show_overlay(&self, ctx: &egui::Context) {
-        #[cfg(target_os = "windows")]
-        if let Some(hwnd) = self.hwnd {
-            unsafe { win32::show_overlay(hwnd); }
-        }
-        #[cfg(not(target_os = "windows"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        let _ = ctx;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     // ── Dismiss helper (used in cancel / timeout / after selection) ───────
@@ -283,16 +222,6 @@ impl eframe::App for ScreenOcrApp {
                     .build()
                     .unwrap(),
             );
-
-            #[cfg(target_os = "windows")]
-            {
-                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                if let Ok(wh) = frame.window_handle() {
-                    if let RawWindowHandle::Win32(h) = wh.window_handle().unwrap().as_raw() {
-                        self.hwnd = Some(h.hwnd.get() as *mut _);
-                    }
-                }
-            }
 
             // Hide immediately — window must not be visible at idle
             self.hide_overlay(ctx);
@@ -534,9 +463,10 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(1.0, 1.0))
             .with_decorations(false)
-            .with_transparent(true)
+            .with_transparent(false) // No DWM transparency needed, image is opaque!
             .with_always_on_top()
-            .with_taskbar(false),
+            .with_taskbar(false)
+            .with_visible(false), // Start immediately hidden
         ..Default::default()
     };
 

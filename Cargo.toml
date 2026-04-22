@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # GUI
-eframe = { version = "0.31", features = ["persistence"] }
+eframe = "0.31"
 egui = "0.31"
 
 # System Tray & Menu
