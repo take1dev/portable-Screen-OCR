@@ -16,9 +16,12 @@ pub fn ensure_tesseract_extracted() -> Result<PathBuf> {
     let tesseract_dir = env::temp_dir().join("screen_ocr_tesseract");
     let tesseract_exe = tesseract_dir.join("tesseract.exe");
 
+    let tesseract_dll = tesseract_dir.join("libcurl-4.dll");
+
     INIT_TESSERACT.call_once(|| {
-        if !tesseract_exe.exists() {
+        if !tesseract_exe.exists() || !tesseract_dll.exists() {
             println!("Extracting bundled Tesseract to {:?}...", tesseract_dir);
+            let _ = fs::remove_dir_all(&tesseract_dir); // Clean up partial state
             if let Err(e) = extract_tesseract(&tesseract_dir) {
                 eprintln!("Failed to extract Tesseract: {}", e);
             }
