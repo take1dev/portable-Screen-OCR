@@ -27,7 +27,7 @@ use image::RgbaImage;
 pub struct ScreenOcrApp {
     // Infrastructure
     tray_icon: Option<TrayIcon>,
-    hotkey_tx: mpsc::Sender<HotkeyCommand>,
+    _hotkey_manager: global_hotkey::GlobalHotKeyManager,
     overlay_active: Arc<AtomicBool>,
     show_settings: Arc<AtomicBool>,
     was_settings_open: bool,
@@ -36,11 +36,6 @@ pub struct ScreenOcrApp {
     config: config::AppConfig,
 
     // ── "Capture-first" state ──
-    // When the hotkey fires we capture the entire virtual desktop into this
-    // buffer, then display it as a frozen image inside the overlay window.
-    // The user draws a selection rectangle on top of the frozen image.
-    // On release we crop from the buffer — no second capture needed, no
-    // timing race, and the overlay itself is never captured.
     frozen_screenshot: Option<RgbaImage>,
     frozen_texture: Option<egui::TextureHandle>,
     frozen_offset_x: i32,
@@ -61,82 +56,15 @@ unsafe impl Send for ScreenOcrApp {}
 unsafe impl Sync for ScreenOcrApp {}
 use std::sync::mpsc;
 
-// ── Isolated Hotkey Thread to bypass Winit conflicts ──
-pub enum HotkeyCommand {
-    Update(HotKey),
-    Quit,
-}
-
-#[cfg(target_os = "windows")]
-fn spawn_hotkey_thread() -> mpsc::Sender<HotkeyCommand> {
-    let (tx, rx) = mpsc::channel::<HotkeyCommand>();
-    
-    std::thread::spawn(move || {
-        let manager = global_hotkey::GlobalHotKeyManager::new().unwrap();
-        
-        // Define Win32 FFI for message pumping
-        #[repr(C)]
-        struct MSG {
-            hwnd: *mut std::ffi::c_void,
-            message: u32,
-            wparam: usize,
-            lparam: isize,
-            time: u32,
-            pt_x: i32,
-            pt_y: i32,
-        }
-        extern "system" {
-            fn PeekMessageW(lpMsg: *mut MSG, hWnd: *mut std::ffi::c_void, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) -> i32;
-            fn TranslateMessage(lpMsg: *const MSG) -> i32;
-            fn DispatchMessageW(lpMsg: *const MSG) -> isize;
-        }
-
-        loop {
-            // 1. Process config updates
-            if let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    HotkeyCommand::Update(hk) => {
-                        let _ = manager.unregister_all(&[]);
-                        if let Err(e) = manager.register(hk) {
-                            notification::notify_error(&format!("Failed to register hotkey. App conflict? {:?}", e));
-                        }
-                    }
-                    HotkeyCommand::Quit => break,
-                }
-            }
-            
-            // 2. Safely pump windows messages required by global-hotkey to dispatch events!
-            unsafe {
-                let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 0x0001 /*PM_REMOVE*/) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-            
-            std::thread::sleep(std::time::Duration::from_millis(16));
-        }
-    });
-    
-    tx
-}
-
-#[cfg(not(target_os = "windows"))]
-fn spawn_hotkey_thread() -> mpsc::Sender<HotkeyCommand> {
-    let (tx, _) = mpsc::channel::<HotkeyCommand>();
-    tx // No-op fallback
-}
-
 impl ScreenOcrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = config::AppConfig::load();
         
-        // Spawn standalone non-Winit hotkey thread
-        let hotkey_tx = spawn_hotkey_thread();
-        
-        // Send initial hotkey registration
+        let hotkey_manager = global_hotkey::GlobalHotKeyManager::new().unwrap();
         let hotkey = HotKey::new(config.get_modifiers(), config.get_code());
-        let _ = hotkey_tx.send(HotkeyCommand::Update(hotkey));
+        if let Err(e) = hotkey_manager.register(hotkey) {
+            notification::notify_error(&format!("Failed to register hotkey. App conflict? {:?}", e));
+        }
 
         let overlay_active = Arc::new(AtomicBool::new(false));
         let show_settings = Arc::new(AtomicBool::new(false));
@@ -173,7 +101,7 @@ impl ScreenOcrApp {
 
         Self {
             tray_icon: None,
-            hotkey_tx,
+            _hotkey_manager: hotkey_manager,
             overlay_active,
             show_settings,
             was_settings_open: false,
@@ -195,17 +123,15 @@ impl ScreenOcrApp {
     // ── Window helpers ────────────────────────────────────────────────────
 
     fn hide_overlay(&mut self, ctx: &egui::Context) {
-        // Instead of making the window completely invisible (which causes Winit
-        // to aggressively suspend the event loop on Windows), we teleport it
-        // off-screen. This guarantees it can always wake up to custom events
-        // and request_repaint calls from background threads.
+        // eframe ignores `request_repaint()` if `Visible(false)`, completely halting our background
+        // hotkey thread's ability to wake the app. We must remain `Visible(true)` but teleport the 
+        // window completely off-screen to remain dormant but responsive.
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(100.0, 100.0)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-20000.0, -20000.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-5000.0, -5000.0)));
         self.frozen_texture = None;
     }
 
     fn show_overlay(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
@@ -213,56 +139,63 @@ impl ScreenOcrApp {
 
     fn dismiss(&mut self, ctx: &egui::Context) {
         self.overlay_active.store(false, Ordering::Relaxed);
+        self.hide_overlay(ctx);
+        self.frozen_screenshot = None;
+        self.frozen_texture = None;
         self.start_pos = None;
         self.current_pos = None;
         self.was_active = false;
         self.overlay_activated_at = None;
-        self.frozen_screenshot = None;
-        self.hide_overlay(ctx);
     }
 
     // ── Capture the entire virtual desktop into `frozen_screenshot` ──────
 
     fn capture_desktop(&mut self) {
-        if let Ok(monitors) = xcap::Monitor::all() {
-            // Compute the virtual desktop bounding box
-            let mut min_x = i32::MAX;
-            let mut min_y = i32::MAX;
-            let mut max_x = i32::MIN;
-            let mut max_y = i32::MIN;
-            for m in &monitors {
-                min_x = min_x.min(m.x());
-                min_y = min_y.min(m.y());
-                max_x = max_x.max(m.x() + m.width() as i32);
-                max_y = max_y.max(m.y() + m.height() as i32);
-            }
+        let monitors_result = xcap::Monitor::all();
+        match monitors_result {
+            Ok(monitors) => {
+                if monitors.is_empty() { 
+                    notification::notify_error("Capture failed: No monitors detected by xcap!");
+                    return; 
+                }
+                
+                let mut min_x = i32::MAX;
+                let mut min_y = i32::MAX;
+                let mut max_x = i32::MIN;
+                let mut max_y = i32::MIN;
+                for monitor in &monitors {
+                    min_x = min_x.min(monitor.x());
+                    min_y = min_y.min(monitor.y());
+                    max_x = max_x.max(monitor.x() + monitor.width() as i32);
+                    max_y = max_y.max(monitor.y() + monitor.height() as i32);
+                }
+                
+                let total_w = (max_x - min_x) as u32;
+                let total_h = (max_y - min_y) as u32;
+                let mut canvas = RgbaImage::new(total_w, total_h);
 
-            let total_w = (max_x - min_x) as u32;
-            let total_h = (max_y - min_y) as u32;
-
-            // Allocate a canvas covering the entire virtual desktop
-            let mut canvas = RgbaImage::new(total_w, total_h);
-
-            for monitor in &monitors {
-                if let Ok(shot) = monitor.capture_image() {
-                    let dx = (monitor.x() - min_x) as u32;
-                    let dy = (monitor.y() - min_y) as u32;
-
-                    // Convert xcap image to image::RgbaImage
-                    let src = RgbaImage::from_raw(
-                        shot.width(), shot.height(), shot.into_raw(),
-                    );
-                    if let Some(src) = src {
-                        image::imageops::overlay(&mut canvas, &src, dx as i64, dy as i64);
+                for monitor in monitors {
+                    if let Ok(shot) = monitor.capture_image() {
+                        let dx = (monitor.x() - min_x) as u32;
+                        let dy = (monitor.y() - min_y) as u32;
+                        let src = RgbaImage::from_raw(shot.width(), shot.height(), shot.into_raw());
+                        if let Some(src) = src {
+                            image::imageops::replace(&mut canvas, &src, dx.into(), dy.into());
+                        }
+                    } else {
+                        notification::notify_error("Capture warning: Failed to capture one of the monitors.");
                     }
                 }
+                
+                self.frozen_offset_x = min_x;
+                self.frozen_offset_y = min_y;
+                self.frozen_width = total_w;
+                self.frozen_height = total_h;
+                self.frozen_screenshot = Some(canvas);
             }
-
-            self.frozen_offset_x = min_x;
-            self.frozen_offset_y = min_y;
-            self.frozen_width = total_w;
-            self.frozen_height = total_h;
-            self.frozen_screenshot = Some(canvas);
+            Err(e) => {
+                notification::notify_error(&format!("Capture error: Failed to enumerate monitors! {}", e));
+            }
         }
     }
 }
@@ -274,7 +207,7 @@ impl eframe::App for ScreenOcrApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── First-frame init ──────────────────────────────────────────────
         if !self.initialized {
             self.initialized = true;
@@ -345,8 +278,11 @@ impl eframe::App for ScreenOcrApp {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         self.config.save();
+                        let _ = self._hotkey_manager.unregister_all(&[]);
                         let hk = HotKey::new(self.config.get_modifiers(), self.config.get_code());
-                        let _ = self.hotkey_tx.send(HotkeyCommand::Update(hk));
+                        if let Err(e) = self._hotkey_manager.register(hk) {
+                            notification::notify_error(&format!("Failed to register hotkey: {:?}", e));
+                        }
                         self.show_settings.store(false, Ordering::Relaxed);
                     }
                     if ui.button("Cancel").clicked() {
