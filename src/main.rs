@@ -18,14 +18,16 @@ use tray_icon::{
 };
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
+use image::RgbaImage;
 
-// Win32 imports for window management
+// ─── Win32: hide/show the eframe window ───────────────────────────────────────
 #[cfg(target_os = "windows")]
 mod win32 {
     use std::ffi::c_void;
     pub type HWND = *mut c_void;
     pub type LONG = i32;
     pub type BOOL = i32;
+
     pub const GWL_EXSTYLE: i32 = -20;
     pub const WS_EX_LAYERED: u32 = 0x00080000;
     pub const WS_EX_NOACTIVATE: u32 = 0x08000000;
@@ -36,7 +38,6 @@ mod win32 {
     pub const SWP_NOSIZE: u32 = 0x0001;
     pub const SWP_NOACTIVATE: u32 = 0x0010;
     pub const SWP_SHOWWINDOW: u32 = 0x0040;
-
     pub const HWND_TOPMOST: isize = -1;
 
     extern "system" {
@@ -44,34 +45,33 @@ mod win32 {
         pub fn SetWindowLongW(hwnd: HWND, n_index: i32, dw_new_long: LONG) -> LONG;
         pub fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
         pub fn SetForegroundWindow(hwnd: HWND) -> BOOL;
-        pub fn SetWindowPos(hwnd: HWND, hwnd_insert_after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> BOOL;
+        pub fn SetWindowPos(
+            hwnd: HWND, insert_after: HWND,
+            x: i32, y: i32, cx: i32, cy: i32, flags: u32,
+        ) -> BOOL;
     }
 
-    /// Hide the window completely — removes it from DWM composition
     pub unsafe fn hide_window(hwnd: HWND) {
         ShowWindow(hwnd, SW_HIDE);
     }
 
-    /// Show the window as a topmost overlay ready for input
     pub unsafe fn show_overlay(hwnd: HWND) {
-        // Ensure the extended style is layered (for transparency) but NOT tool-window-only
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         let new_style = (style | WS_EX_LAYERED) & !WS_EX_NOACTIVATE;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_style as i32);
-
-        // Show + bring to topmost without stealing focus initially
         SetWindowPos(
-            hwnd,
-            HWND_TOPMOST as *mut c_void,
+            hwnd, HWND_TOPMOST as *mut c_void,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
-        // Now activate so we get keyboard/mouse
         SetForegroundWindow(hwnd);
     }
 }
 
+// ─── App state ────────────────────────────────────────────────────────────────
+
 pub struct ScreenOcrApp {
+    // Infrastructure
     tray_icon: Option<TrayIcon>,
     _hotkey_manager: GlobalHotKeyManager,
     overlay_active: Arc<AtomicBool>,
@@ -82,19 +82,28 @@ pub struct ScreenOcrApp {
     config: config::AppConfig,
     hwnd: Option<*mut std::ffi::c_void>,
 
+    // ── "Capture-first" state ──
+    // When the hotkey fires we capture the entire virtual desktop into this
+    // buffer, then display it as a frozen image inside the overlay window.
+    // The user draws a selection rectangle on top of the frozen image.
+    // On release we crop from the buffer — no second capture needed, no
+    // timing race, and the overlay itself is never captured.
+    frozen_screenshot: Option<RgbaImage>,
+    frozen_texture: Option<egui::TextureHandle>,
+    frozen_offset_x: i32,
+    frozen_offset_y: i32,
+    frozen_width: u32,
+    frozen_height: u32,
+
     // Selection state
     start_pos: Option<egui::Pos2>,
     current_pos: Option<egui::Pos2>,
 
-    // Auto-dismiss: hide overlay after 30s of inactivity
+    // 30-second safety timeout
     overlay_activated_at: Option<Instant>,
-
-    // Position offset spanning all monitors
-    window_offset_x: i32,
-    window_offset_y: i32,
 }
 
-// SAFETY: we only access hwnd from the main thread
+// SAFETY: hwnd is only accessed from the main (GUI) thread.
 unsafe impl Send for ScreenOcrApp {}
 unsafe impl Sync for ScreenOcrApp {}
 
@@ -106,38 +115,33 @@ impl ScreenOcrApp {
         let _ = hotkey_manager.register(hotkey);
 
         let overlay_active = Arc::new(AtomicBool::new(false));
-        let overlay_active_clone = overlay_active.clone();
-
         let show_settings = Arc::new(AtomicBool::new(false));
-        let show_settings_clone = show_settings.clone();
 
-        // Background thread: handles hotkey + tray exit events
-        let ctx = cc.egui_ctx.clone();
-        std::thread::spawn(move || {
-            loop {
-                // Handle tray exit
+        // Background thread: poll hotkey + tray menu events
+        {
+            let overlay = overlay_active.clone();
+            let settings = show_settings.clone();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
                 if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                     if event.id() == &tray_icon::menu::MenuId::new("exit") {
                         std::process::exit(0);
                     } else if event.id() == &tray_icon::menu::MenuId::new("change_shortcut") {
-                        show_settings_clone.store(true, Ordering::Relaxed);
+                        settings.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
                     }
                 }
-
-                // Handle hotkey
-                while let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
-                    if event.state == global_hotkey::HotKeyState::Released {
-                        if !overlay_active_clone.load(Ordering::Relaxed) {
-                            overlay_active_clone.store(true, Ordering::Relaxed);
-                            ctx.request_repaint();
-                        }
+                while let Ok(ev) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
+                    if ev.state == global_hotkey::HotKeyState::Released
+                        && !overlay.load(Ordering::Relaxed)
+                    {
+                        overlay.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
                     }
                 }
-
                 std::thread::sleep(std::time::Duration::from_millis(16));
-            }
-        });
+            });
+        }
 
         Self {
             tray_icon: None,
@@ -149,41 +153,102 @@ impl ScreenOcrApp {
             initialized: false,
             config,
             hwnd: None,
+            frozen_screenshot: None,
+            frozen_texture: None,
+            frozen_offset_x: 0,
+            frozen_offset_y: 0,
+            frozen_width: 0,
+            frozen_height: 0,
             start_pos: None,
             current_pos: None,
             overlay_activated_at: None,
-            window_offset_x: 0,
-            window_offset_y: 0,
         }
     }
 
-    /// Hide the overlay window completely so it's removed from DWM composition.
-    /// This is the key fix for Parsec: no window in the composition chain = no flicker.
-    fn hide_overlay(&self, ctx: &egui::Context) {
+    // ── Window helpers ────────────────────────────────────────────────────
+
+    fn hide_overlay(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.hwnd {
             unsafe { win32::hide_window(hwnd); }
         }
         #[cfg(not(target_os = "windows"))]
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        let _ = ctx; // suppress unused warning on windows
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        let _ = ctx;
+
+        // Free the GPU texture when we hide
+        self.frozen_texture = None;
     }
 
-    /// Show the overlay window and bring it to front for selection.
     fn show_overlay(&self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.hwnd {
             unsafe { win32::show_overlay(hwnd); }
         }
         #[cfg(not(target_os = "windows"))]
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         let _ = ctx;
     }
+
+    // ── Dismiss helper (used in cancel / timeout / after selection) ───────
+
+    fn dismiss(&mut self, ctx: &egui::Context) {
+        self.overlay_active.store(false, Ordering::Relaxed);
+        self.start_pos = None;
+        self.current_pos = None;
+        self.was_active = false;
+        self.overlay_activated_at = None;
+        self.frozen_screenshot = None;
+        self.hide_overlay(ctx);
+    }
+
+    // ── Capture the entire virtual desktop into `frozen_screenshot` ──────
+
+    fn capture_desktop(&mut self) {
+        if let Ok(monitors) = xcap::Monitor::all() {
+            // Compute the virtual desktop bounding box
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            for m in &monitors {
+                min_x = min_x.min(m.x());
+                min_y = min_y.min(m.y());
+                max_x = max_x.max(m.x() + m.width() as i32);
+                max_y = max_y.max(m.y() + m.height() as i32);
+            }
+
+            let total_w = (max_x - min_x) as u32;
+            let total_h = (max_y - min_y) as u32;
+
+            // Allocate a canvas covering the entire virtual desktop
+            let mut canvas = RgbaImage::new(total_w, total_h);
+
+            for monitor in &monitors {
+                if let Ok(shot) = monitor.capture_image() {
+                    let dx = (monitor.x() - min_x) as u32;
+                    let dy = (monitor.y() - min_y) as u32;
+
+                    // Convert xcap image to image::RgbaImage
+                    let src = RgbaImage::from_raw(
+                        shot.width(), shot.height(), shot.into_raw(),
+                    );
+                    if let Some(src) = src {
+                        image::imageops::overlay(&mut canvas, &src, dx as i64, dy as i64);
+                    }
+                }
+            }
+
+            self.frozen_offset_x = min_x;
+            self.frozen_offset_y = min_y;
+            self.frozen_width = total_w;
+            self.frozen_height = total_h;
+            self.frozen_screenshot = Some(canvas);
+        }
+    }
 }
+
+// ─── eframe::App ─────────────────────────────────────────────────────────────
 
 impl eframe::App for ScreenOcrApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -191,25 +256,24 @@ impl eframe::App for ScreenOcrApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // ── First-frame init: tray icon, HWND, then immediately hide ──
+        // ── First-frame init ──────────────────────────────────────────────
         if !self.initialized {
             self.initialized = true;
 
-            // Build tray icon
             let tray_menu = Menu::new();
-            let change_shortcut_i = MenuItem::with_id("change_shortcut", "Change Shortcut", true, None);
-            let quit_i = MenuItem::with_id("exit", "Exit", true, None);
-            tray_menu.append_items(&[&change_shortcut_i, &quit_i]).unwrap();
+            let change_i = MenuItem::with_id("change_shortcut", "Change Shortcut", true, None);
+            let quit_i   = MenuItem::with_id("exit", "Exit", true, None);
+            tray_menu.append_items(&[&change_i, &quit_i]).unwrap();
 
             let icon_bytes = include_bytes!("../assets/icon.png");
-            let (icon_rgba, icon_width, icon_height) = {
-                let image = image::load_from_memory(icon_bytes)
+            let (icon_rgba, icon_w, icon_h) = {
+                let img = image::load_from_memory(icon_bytes)
                     .expect("Failed to load icon")
                     .into_rgba8();
-                let (width, height) = image.dimensions();
-                (image.into_raw(), width, height)
+                let (w, h) = img.dimensions();
+                (img.into_raw(), w, h)
             };
-            let icon = Icon::from_rgba(icon_rgba, icon_width, icon_height).unwrap();
+            let icon = Icon::from_rgba(icon_rgba, icon_w, icon_h).unwrap();
 
             self.tray_icon = Some(
                 TrayIconBuilder::new()
@@ -220,7 +284,6 @@ impl eframe::App for ScreenOcrApp {
                     .unwrap(),
             );
 
-            // Grab HWND
             #[cfg(target_os = "windows")]
             {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -231,16 +294,15 @@ impl eframe::App for ScreenOcrApp {
                 }
             }
 
-            // Immediately hide — the window should NOT be visible at idle
+            // Hide immediately — window must not be visible at idle
             self.hide_overlay(ctx);
             return;
         }
 
-        // ── Settings panel (shown in a small visible window) ──
+        // ── Settings panel ────────────────────────────────────────────────
         let is_settings = self.show_settings.load(Ordering::Relaxed);
         if is_settings {
             if !self.was_settings_open {
-                // Show a small centered window for settings
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(400.0, 250.0)));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
                 self.show_overlay(ctx);
@@ -256,18 +318,20 @@ impl eframe::App for ScreenOcrApp {
                     ui.checkbox(&mut self.config.modifier_alt, "Alt");
                     ui.checkbox(&mut self.config.modifier_meta, "Win");
                 });
-
-                egui::ComboBox::from_label("Key").selected_text(&self.config.key).show_ui(ui, |ui| {
-                    let keys = [
-                        "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ",
-                        "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9",
-                        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
-                    ];
-                    for k in keys {
-                        ui.selectable_value(&mut self.config.key, k.to_string(), k);
-                    }
-                });
-
+                egui::ComboBox::from_label("Key")
+                    .selected_text(&self.config.key)
+                    .show_ui(ui, |ui| {
+                        let keys = [
+                            "KeyA","KeyB","KeyC","KeyD","KeyE","KeyF","KeyG","KeyH","KeyI","KeyJ",
+                            "KeyK","KeyL","KeyM","KeyN","KeyO","KeyP","KeyQ","KeyR","KeyS","KeyT",
+                            "KeyU","KeyV","KeyW","KeyX","KeyY","KeyZ",
+                            "Digit0","Digit1","Digit2","Digit3","Digit4","Digit5","Digit6","Digit7","Digit8","Digit9",
+                            "F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12",
+                        ];
+                        for k in keys {
+                            ui.selectable_value(&mut self.config.key, k.to_string(), k);
+                        }
+                    });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -285,128 +349,125 @@ impl eframe::App for ScreenOcrApp {
             });
             return;
         } else if self.was_settings_open {
-            // Settings just closed — hide window again
             self.hide_overlay(ctx);
             self.was_settings_open = false;
         }
 
-        // ── Overlay activation transition ──
+        // ── Overlay activation transition ─────────────────────────────────
         let is_active = self.overlay_active.load(Ordering::Relaxed);
 
         if is_active && !self.was_active {
-            // TRANSITION: idle → active. Show the window, resize to span monitors.
+            // 1. Capture the desktop FIRST (before showing any overlay)
+            self.capture_desktop();
             self.was_active = true;
             self.overlay_activated_at = Some(Instant::now());
 
-            if let Ok(monitors) = xcap::Monitor::all() {
-                let mut min_x = i32::MAX;
-                let mut min_y = i32::MAX;
-                let mut max_x = i32::MIN;
-                let mut max_y = i32::MIN;
+            // 2. Resize the eframe window to span the virtual desktop
+            let scale = ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                self.frozen_offset_x as f32 / scale,
+                self.frozen_offset_y as f32 / scale,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                self.frozen_width as f32 / scale,
+                self.frozen_height as f32 / scale,
+            )));
 
-                for m in &monitors {
-                    min_x = min_x.min(m.x());
-                    min_y = min_y.min(m.y());
-                    max_x = max_x.max(m.x() + m.width() as i32);
-                    max_y = max_y.max(m.y() + m.height() as i32);
-                }
-
-                if min_x < i32::MAX {
-                    self.window_offset_x = min_x;
-                    self.window_offset_y = min_y;
-                    let scale = ctx.pixels_per_point();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                        min_x as f32 / scale,
-                        min_y as f32 / scale,
-                    )));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        (max_x - min_x) as f32 / scale,
-                        (max_y - min_y) as f32 / scale,
-                    )));
-                }
-            }
-
-            // Show the window (it was hidden)
+            // 3. Now show the window
             self.show_overlay(ctx);
         } else if !is_active && self.was_active {
-            // TRANSITION: active → idle. Hide the window completely.
             self.was_active = false;
             self.hide_overlay(ctx);
         }
 
-        // ── If not active, do nothing (window is hidden, no rendering) ──
         if !is_active {
             return;
         }
 
-        // ── Auto-dismiss after 30 seconds ──
-        if let Some(activated_at) = self.overlay_activated_at {
-            if activated_at.elapsed().as_secs() >= 30 {
-                self.overlay_active.store(false, Ordering::Relaxed);
-                self.start_pos = None;
-                self.current_pos = None;
-                self.was_active = false;
-                self.overlay_activated_at = None;
-                self.hide_overlay(ctx);
+        // ── Auto-dismiss after 30 seconds ─────────────────────────────────
+        if let Some(t) = self.overlay_activated_at {
+            if t.elapsed().as_secs() >= 30 {
+                self.dismiss(ctx);
                 return;
             }
         }
 
-        // ── Active overlay: draw selection UI ──
+        // ── Upload frozen screenshot as a texture (once per activation) ───
+        if self.frozen_texture.is_none() {
+            if let Some(ref img) = self.frozen_screenshot {
+                let size = [img.width() as usize, img.height() as usize];
+                let pixels = img.as_raw();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels);
+                self.frozen_texture = Some(ctx.load_texture(
+                    "frozen_desktop",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
+        // ── Draw ──────────────────────────────────────────────────────────
         let screen_rect = ctx.screen_rect();
+
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
             egui::Id::new("overlay"),
         ));
 
-        // Cancel on Escape or right-click
+        // Paint the frozen screenshot as the background so the user sees a
+        // "frozen" desktop rather than a transparent/black surface.
+        if let Some(ref tex) = self.frozen_texture {
+            painter.image(
+                tex.id(),
+                screen_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // Cancel on Escape / right-click
         if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
-            self.overlay_active.store(false, Ordering::Relaxed);
-            self.start_pos = None;
-            self.current_pos = None;
-            self.was_active = false;
-            self.hide_overlay(ctx);
+            self.dismiss(ctx);
             return;
         }
 
-        // Draw dim overlay
+        // Dim + selection rectangle
+        let dim = egui::Color32::from_black_alpha(120);
         match (self.start_pos, self.current_pos) {
             (Some(p1), Some(p2)) => {
-                let selection_rect = egui::Rect::from_two_pos(p1, p2);
-                let dim = egui::Color32::from_black_alpha(160);
+                let sel = egui::Rect::from_two_pos(p1, p2);
                 // Top
                 painter.rect_filled(
-                    egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, selection_rect.min.y)),
+                    egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, sel.min.y)),
                     0.0, dim,
                 );
                 // Bottom
                 painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.max.y), screen_rect.max),
+                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, sel.max.y), screen_rect.max),
                     0.0, dim,
                 );
                 // Left
                 painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.min.y), egui::pos2(selection_rect.min.x, selection_rect.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, sel.min.y), egui::pos2(sel.min.x, sel.max.y)),
                     0.0, dim,
                 );
                 // Right
                 painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(selection_rect.max.x, selection_rect.min.y), egui::pos2(screen_rect.max.x, selection_rect.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(sel.max.x, sel.min.y), egui::pos2(screen_rect.max.x, sel.max.y)),
                     0.0, dim,
                 );
                 painter.rect_stroke(
-                    selection_rect,
-                    0.0,
+                    sel, 0.0,
                     egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 180, 255)),
                     egui::StrokeKind::Outside,
                 );
             }
             _ => {
-                painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(160));
+                painter.rect_filled(screen_rect, 0.0, dim);
             }
         }
 
-        // Handle mouse input
+        // ── Mouse handling ────────────────────────────────────────────────
         let pointer = ctx.input(|i| i.pointer.clone());
         if pointer.primary_pressed() {
             self.start_pos = pointer.interact_pos();
@@ -417,28 +478,47 @@ impl eframe::App for ScreenOcrApp {
         if pointer.primary_released() && self.start_pos.is_some() && self.current_pos.is_some() {
             let p1 = self.start_pos.unwrap();
             let p2 = self.current_pos.unwrap();
-            let selection_rect = egui::Rect::from_two_pos(p1, p2);
 
-            self.overlay_active.store(false, Ordering::Relaxed);
-            self.start_pos = None;
-            self.current_pos = None;
-            self.was_active = false;
+            // The selection is in logical (egui) coordinates.
+            // Convert to physical pixels inside the frozen_screenshot buffer.
+            let scale = ctx.pixels_per_point();
+            let sel = egui::Rect::from_two_pos(p1, p2);
+            let px = (sel.min.x * scale) as u32;
+            let py = (sel.min.y * scale) as u32;
+            let pw = ((sel.width() * scale) as u32).max(1);
+            let ph = ((sel.height() * scale) as u32).max(1);
 
-            // Hide the window immediately
-            self.hide_overlay(ctx);
+            // Take ownership of the frozen screenshot for the OCR thread
+            let screenshot = self.frozen_screenshot.take();
 
-            let scale_factor = ctx.pixels_per_point();
-            let ox = self.window_offset_x;
-            let oy = self.window_offset_y;
+            // Dismiss the overlay immediately
+            self.dismiss(ctx);
+
+            // OCR in a background thread
             std::thread::spawn(move || {
-                // Small delay to let the window fully hide before capturing
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(image) = capture::capture_region(selection_rect, scale_factor, ox, oy) {
-                    let processed = preprocessing::preprocess(image);
-                    if let Ok(text) = ocr::recognize(&processed, "eng+srp_latn", 6) {
-                        if !text.trim().is_empty() {
+                if let Some(full) = screenshot {
+                    // Clamp to image bounds
+                    let img_w = full.width();
+                    let img_h = full.height();
+                    let cx = px.min(img_w.saturating_sub(1));
+                    let cy = py.min(img_h.saturating_sub(1));
+                    let cw = pw.min(img_w - cx);
+                    let ch = ph.min(img_h - cy);
+
+                    if cw == 0 || ch == 0 { return; }
+
+                    let cropped = image::imageops::crop_imm(&full, cx, cy, cw, ch).to_image();
+                    let dynamic = image::DynamicImage::ImageRgba8(cropped);
+                    let processed = preprocessing::preprocess(dynamic);
+
+                    match ocr::recognize(&processed, "eng+srp_latn", 6) {
+                        Ok(text) if !text.trim().is_empty() => {
                             let _ = clipboard::copy_to_clipboard(&text);
                             notification::notify_success();
+                        }
+                        Ok(_) => {} // empty text, nothing to copy
+                        Err(e) => {
+                            eprintln!("OCR error: {e}");
                         }
                     }
                 }
@@ -447,9 +527,9 @@ impl eframe::App for ScreenOcrApp {
     }
 }
 
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
 fn main() -> eframe::Result<()> {
-    // Start with a small initial size — will be resized when overlay activates.
-    // The window is hidden immediately on first frame anyway.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(1.0, 1.0))
