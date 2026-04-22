@@ -55,6 +55,7 @@ pub struct ScreenOcrApp {
     overlay_active: Arc<AtomicBool>,
     show_settings: Arc<AtomicBool>,
     was_settings_open: bool,
+    was_active: bool,
     config: config::AppConfig,
     hwnd: Option<*mut std::ffi::c_void>,
     
@@ -119,6 +120,7 @@ impl ScreenOcrApp {
             overlay_active,
             show_settings,
             was_settings_open: false,
+            was_active: false,
             config,
             hwnd: None,
             start_pos: None,
@@ -231,8 +233,8 @@ impl eframe::App for ScreenOcrApp {
 
         let is_active = self.overlay_active.load(Ordering::Relaxed) && !is_settings;
 
-        // Transition: became active
-        if is_active && self.start_pos.is_none() && self.current_pos.is_none() {
+        if is_active && !self.was_active {
+            self.was_active = true;
             // Resize to span all monitors if not already done
             if let Ok(monitors) = xcap::Monitor::all() {
                 let mut min_x = i32::MAX;
@@ -267,6 +269,8 @@ impl eframe::App for ScreenOcrApp {
             if let Some(hwnd) = self.hwnd {
                 unsafe { win32::set_click_through(hwnd, false); }
             }
+        } else if !is_active && self.was_active {
+            self.was_active = false;
         }
 
         if is_active {
@@ -281,6 +285,7 @@ impl eframe::App for ScreenOcrApp {
                 self.overlay_active.store(false, Ordering::Relaxed);
                 self.start_pos = None;
                 self.current_pos = None;
+                self.was_active = false;
                 #[cfg(target_os = "windows")]
                 if let Some(hwnd) = self.hwnd {
                     unsafe { win32::set_click_through(hwnd, true); }
@@ -342,6 +347,7 @@ impl eframe::App for ScreenOcrApp {
                 self.overlay_active.store(false, Ordering::Relaxed);
                 self.start_pos = None;
                 self.current_pos = None;
+                self.was_active = false;
 
                 // Re-enable click-through
                 #[cfg(target_os = "windows")]
