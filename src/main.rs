@@ -27,7 +27,7 @@ use image::RgbaImage;
 pub struct ScreenOcrApp {
     // Infrastructure
     tray_icon: Option<TrayIcon>,
-    _hotkey_manager: GlobalHotKeyManager,
+    hotkey_tx: mpsc::Sender<HotkeyCommand>,
     overlay_active: Arc<AtomicBool>,
     show_settings: Arc<AtomicBool>,
     was_settings_open: bool,
@@ -59,15 +59,84 @@ pub struct ScreenOcrApp {
 // ScreenOcrApp works safely across threads
 unsafe impl Send for ScreenOcrApp {}
 unsafe impl Sync for ScreenOcrApp {}
+use std::sync::mpsc;
+
+// ── Isolated Hotkey Thread to bypass Winit conflicts ──
+pub enum HotkeyCommand {
+    Update(HotKey),
+    Quit,
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_hotkey_thread() -> mpsc::Sender<HotkeyCommand> {
+    let (tx, rx) = mpsc::channel::<HotkeyCommand>();
+    
+    std::thread::spawn(move || {
+        let manager = global_hotkey::GlobalHotKeyManager::new().unwrap();
+        
+        // Define Win32 FFI for message pumping
+        #[repr(C)]
+        struct MSG {
+            hwnd: *mut std::ffi::c_void,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            time: u32,
+            pt_x: i32,
+            pt_y: i32,
+        }
+        extern "system" {
+            fn PeekMessageW(lpMsg: *mut MSG, hWnd: *mut std::ffi::c_void, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) -> i32;
+            fn TranslateMessage(lpMsg: *const MSG) -> i32;
+            fn DispatchMessageW(lpMsg: *const MSG) -> isize;
+        }
+
+        loop {
+            // 1. Process config updates
+            if let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    HotkeyCommand::Update(hk) => {
+                        let _ = manager.unregister_all(&[]);
+                        if let Err(e) = manager.register(hk) {
+                            notification::notify_error(&format!("Failed to register hotkey. App conflict? {:?}", e));
+                        }
+                    }
+                    HotkeyCommand::Quit => break,
+                }
+            }
+            
+            // 2. Safely pump windows messages required by global-hotkey to dispatch events!
+            unsafe {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 0x0001 /*PM_REMOVE*/) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+    });
+    
+    tx
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_hotkey_thread() -> mpsc::Sender<HotkeyCommand> {
+    let (tx, _) = mpsc::channel::<HotkeyCommand>();
+    tx // No-op fallback
+}
 
 impl ScreenOcrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = config::AppConfig::load();
-        let hotkey_manager = GlobalHotKeyManager::new().unwrap();
+        
+        // Spawn standalone non-Winit hotkey thread
+        let hotkey_tx = spawn_hotkey_thread();
+        
+        // Send initial hotkey registration
         let hotkey = HotKey::new(config.get_modifiers(), config.get_code());
-        if let Err(e) = hotkey_manager.register(hotkey) {
-            notification::notify_error(&format!("Failed to register hotkey. Might be mapped by another app! ({:?})", e));
-        }
+        let _ = hotkey_tx.send(HotkeyCommand::Update(hotkey));
 
         let overlay_active = Arc::new(AtomicBool::new(false));
         let show_settings = Arc::new(AtomicBool::new(false));
@@ -104,7 +173,7 @@ impl ScreenOcrApp {
 
         Self {
             tray_icon: None,
-            _hotkey_manager: hotkey_manager,
+            hotkey_tx,
             overlay_active,
             show_settings,
             was_settings_open: false,
@@ -276,11 +345,8 @@ impl eframe::App for ScreenOcrApp {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         self.config.save();
-                        let _ = self._hotkey_manager.unregister_all(&[]);
                         let hk = HotKey::new(self.config.get_modifiers(), self.config.get_code());
-                        if let Err(e) = self._hotkey_manager.register(hk) {
-                            notification::notify_error(&format!("Failed to register hotkey: {:?}", e));
-                        }
+                        let _ = self.hotkey_tx.send(HotkeyCommand::Update(hk));
                         self.show_settings.store(false, Ordering::Relaxed);
                     }
                     if ui.button("Cancel").clicked() {
