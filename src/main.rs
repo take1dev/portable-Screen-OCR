@@ -17,6 +17,7 @@ use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
 };
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::Instant;
 
 // Win32 imports for window management
 #[cfg(target_os = "windows")]
@@ -85,6 +86,9 @@ pub struct ScreenOcrApp {
     start_pos: Option<egui::Pos2>,
     current_pos: Option<egui::Pos2>,
 
+    // Auto-dismiss: hide overlay after 30s of inactivity
+    overlay_activated_at: Option<Instant>,
+
     // Position offset spanning all monitors
     window_offset_x: i32,
     window_offset_y: i32,
@@ -147,6 +151,7 @@ impl ScreenOcrApp {
             hwnd: None,
             start_pos: None,
             current_pos: None,
+            overlay_activated_at: None,
             window_offset_x: 0,
             window_offset_y: 0,
         }
@@ -291,6 +296,7 @@ impl eframe::App for ScreenOcrApp {
         if is_active && !self.was_active {
             // TRANSITION: idle → active. Show the window, resize to span monitors.
             self.was_active = true;
+            self.overlay_activated_at = Some(Instant::now());
 
             if let Ok(monitors) = xcap::Monitor::all() {
                 let mut min_x = i32::MAX;
@@ -331,6 +337,19 @@ impl eframe::App for ScreenOcrApp {
         // ── If not active, do nothing (window is hidden, no rendering) ──
         if !is_active {
             return;
+        }
+
+        // ── Auto-dismiss after 30 seconds ──
+        if let Some(activated_at) = self.overlay_activated_at {
+            if activated_at.elapsed().as_secs() >= 30 {
+                self.overlay_active.store(false, Ordering::Relaxed);
+                self.start_pos = None;
+                self.current_pos = None;
+                self.was_active = false;
+                self.overlay_activated_at = None;
+                self.hide_overlay(ctx);
+                return;
+            }
         }
 
         // ── Active overlay: draw selection UI ──
