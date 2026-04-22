@@ -370,8 +370,6 @@ impl eframe::App for ScreenOcrApp {
                     }
                 });
             }
-
-            ctx.request_repaint();
         }
     }
 }
