@@ -9,7 +9,7 @@ mod config;
 
 use eframe::egui;
 use global_hotkey::{
-    hotkey::{Code, Modifiers, HotKey},
+    hotkey::HotKey,
     GlobalHotKeyManager,
 };
 use tray_icon::{
@@ -18,34 +18,55 @@ use tray_icon::{
 };
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-// Win32 imports for click-through toggling
+// Win32 imports for window management
 #[cfg(target_os = "windows")]
 mod win32 {
     use std::ffi::c_void;
     pub type HWND = *mut c_void;
     pub type LONG = i32;
+    pub type BOOL = i32;
     pub const GWL_EXSTYLE: i32 = -20;
-    pub const WS_EX_TRANSPARENT: u32 = 0x00000020;
     pub const WS_EX_LAYERED: u32 = 0x00080000;
     pub const WS_EX_NOACTIVATE: u32 = 0x08000000;
+
+    pub const SW_HIDE: i32 = 0;
+
+    pub const SWP_NOMOVE: u32 = 0x0002;
+    pub const SWP_NOSIZE: u32 = 0x0001;
+    pub const SWP_NOACTIVATE: u32 = 0x0010;
+    pub const SWP_SHOWWINDOW: u32 = 0x0040;
+
+    pub const HWND_TOPMOST: isize = -1;
 
     extern "system" {
         pub fn GetWindowLongW(hwnd: HWND, n_index: i32) -> LONG;
         pub fn SetWindowLongW(hwnd: HWND, n_index: i32, dw_new_long: LONG) -> LONG;
-        pub fn SetForegroundWindow(hwnd: HWND) -> i32;
+        pub fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
+        pub fn SetForegroundWindow(hwnd: HWND) -> BOOL;
+        pub fn SetWindowPos(hwnd: HWND, hwnd_insert_after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> BOOL;
     }
 
-    pub unsafe fn set_click_through(hwnd: HWND, enabled: bool) {
+    /// Hide the window completely — removes it from DWM composition
+    pub unsafe fn hide_window(hwnd: HWND) {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+
+    /// Show the window as a topmost overlay ready for input
+    pub unsafe fn show_overlay(hwnd: HWND) {
+        // Ensure the extended style is layered (for transparency) but NOT tool-window-only
         let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_style = if enabled {
-            style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE
-        } else {
-            (style & !(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)) | WS_EX_LAYERED
-        };
+        let new_style = (style | WS_EX_LAYERED) & !WS_EX_NOACTIVATE;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_style as i32);
-        if !enabled {
-            SetForegroundWindow(hwnd);
-        }
+
+        // Show + bring to topmost without stealing focus initially
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST as *mut c_void,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+        // Now activate so we get keyboard/mouse
+        SetForegroundWindow(hwnd);
     }
 }
 
@@ -56,13 +77,14 @@ pub struct ScreenOcrApp {
     show_settings: Arc<AtomicBool>,
     was_settings_open: bool,
     was_active: bool,
+    initialized: bool,
     config: config::AppConfig,
     hwnd: Option<*mut std::ffi::c_void>,
-    
+
     // Selection state
     start_pos: Option<egui::Pos2>,
     current_pos: Option<egui::Pos2>,
-    
+
     // Position offset spanning all monitors
     window_offset_x: i32,
     window_offset_y: i32,
@@ -81,7 +103,7 @@ impl ScreenOcrApp {
 
         let overlay_active = Arc::new(AtomicBool::new(false));
         let overlay_active_clone = overlay_active.clone();
-        
+
         let show_settings = Arc::new(AtomicBool::new(false));
         let show_settings_clone = show_settings.clone();
 
@@ -99,10 +121,9 @@ impl ScreenOcrApp {
                     }
                 }
 
-                // Handle hotkey - only toggle on if overlay is off
+                // Handle hotkey
                 while let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
                     if event.state == global_hotkey::HotKeyState::Released {
-                        // Only show if not already active
                         if !overlay_active_clone.load(Ordering::Relaxed) {
                             overlay_active_clone.store(true, Ordering::Relaxed);
                             ctx.request_repaint();
@@ -121,6 +142,7 @@ impl ScreenOcrApp {
             show_settings,
             was_settings_open: false,
             was_active: false,
+            initialized: false,
             config,
             hwnd: None,
             start_pos: None,
@@ -129,17 +151,46 @@ impl ScreenOcrApp {
             window_offset_y: 0,
         }
     }
+
+    /// Hide the overlay window completely so it's removed from DWM composition.
+    /// This is the key fix for Parsec: no window in the composition chain = no flicker.
+    fn hide_overlay(&self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd {
+            unsafe { win32::hide_window(hwnd); }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        let _ = ctx; // suppress unused warning on windows
+    }
+
+    /// Show the overlay window and bring it to front for selection.
+    fn show_overlay(&self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd {
+            unsafe { win32::show_overlay(hwnd); }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        let _ = ctx;
+    }
 }
 
 impl eframe::App for ScreenOcrApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Always fully transparent background
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Initialize tray icon on first frame
-        if self.tray_icon.is_none() {
+        // ── First-frame init: tray icon, HWND, then immediately hide ──
+        if !self.initialized {
+            self.initialized = true;
+
+            // Build tray icon
             let tray_menu = Menu::new();
             let change_shortcut_i = MenuItem::with_id("change_shortcut", "Change Shortcut", true, None);
             let quit_i = MenuItem::with_id("exit", "Exit", true, None);
@@ -164,7 +215,7 @@ impl eframe::App for ScreenOcrApp {
                     .unwrap(),
             );
 
-            // Get and store the HWND for click-through toggling
+            // Grab HWND
             #[cfg(target_os = "windows")]
             {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -173,30 +224,34 @@ impl eframe::App for ScreenOcrApp {
                         self.hwnd = Some(h.hwnd.get() as *mut _);
                     }
                 }
-
-                // Start fully click-through (invisible to input)
-                if let Some(hwnd) = self.hwnd {
-                    unsafe { win32::set_click_through(hwnd, true); }
-                }
             }
+
+            // Immediately hide — the window should NOT be visible at idle
+            self.hide_overlay(ctx);
+            return;
         }
+
+        // ── Settings panel (shown in a small visible window) ──
         let is_settings = self.show_settings.load(Ordering::Relaxed);
         if is_settings {
             if !self.was_settings_open {
-                #[cfg(target_os = "windows")]
-                if let Some(hwnd) = self.hwnd { unsafe { win32::set_click_through(hwnd, false); } }
+                // Show a small centered window for settings
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(400.0, 250.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
+                self.show_overlay(ctx);
                 self.was_settings_open = true;
             }
 
-            egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
+            egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Global Hotkey Configuration");
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.config.modifier_ctrl, "Ctrl");
                     ui.checkbox(&mut self.config.modifier_shift, "Shift");
                     ui.checkbox(&mut self.config.modifier_alt, "Alt");
                     ui.checkbox(&mut self.config.modifier_meta, "Win");
                 });
-                
+
                 egui::ComboBox::from_label("Key").selected_text(&self.config.key).show_ui(ui, |ui| {
                     let keys = [
                         "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ",
@@ -218,24 +273,25 @@ impl eframe::App for ScreenOcrApp {
                         self.show_settings.store(false, Ordering::Relaxed);
                     }
                     if ui.button("Cancel").clicked() {
-                        // Reload from disk to discard changes
                         self.config = config::AppConfig::load();
                         self.show_settings.store(false, Ordering::Relaxed);
                     }
                 });
             });
-            ctx.request_repaint();
+            return;
         } else if self.was_settings_open {
-            #[cfg(target_os = "windows")]
-            if let Some(hwnd) = self.hwnd { unsafe { win32::set_click_through(hwnd, true); } }
+            // Settings just closed — hide window again
+            self.hide_overlay(ctx);
             self.was_settings_open = false;
         }
 
-        let is_active = self.overlay_active.load(Ordering::Relaxed) && !is_settings;
+        // ── Overlay activation transition ──
+        let is_active = self.overlay_active.load(Ordering::Relaxed);
 
         if is_active && !self.was_active {
+            // TRANSITION: idle → active. Show the window, resize to span monitors.
             self.was_active = true;
-            // Resize to span all monitors if not already done
+
             if let Ok(monitors) = xcap::Monitor::all() {
                 let mut min_x = i32::MAX;
                 let mut min_y = i32::MAX;
@@ -264,142 +320,120 @@ impl eframe::App for ScreenOcrApp {
                 }
             }
 
-            // Disable click-through so we can receive mouse input
-            #[cfg(target_os = "windows")]
-            if let Some(hwnd) = self.hwnd {
-                unsafe { win32::set_click_through(hwnd, false); }
-            }
+            // Show the window (it was hidden)
+            self.show_overlay(ctx);
         } else if !is_active && self.was_active {
+            // TRANSITION: active → idle. Hide the window completely.
             self.was_active = false;
+            self.hide_overlay(ctx);
         }
 
-        if is_active {
-            let screen_rect = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Background,
-                egui::Id::new("overlay"),
-            ));
+        // ── If not active, do nothing (window is hidden, no rendering) ──
+        if !is_active {
+            return;
+        }
 
-            // Cancel on Escape or right-click
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
-                self.overlay_active.store(false, Ordering::Relaxed);
-                self.start_pos = None;
-                self.current_pos = None;
-                self.was_active = false;
-                #[cfg(target_os = "windows")]
-                if let Some(hwnd) = self.hwnd {
-                    unsafe { win32::set_click_through(hwnd, true); }
-                }
-                ctx.request_repaint();
-                return;
-            }
+        // ── Active overlay: draw selection UI ──
+        let screen_rect = ctx.screen_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("overlay"),
+        ));
 
-            // Draw dim overlay
-            match (self.start_pos, self.current_pos) {
-                (Some(p1), Some(p2)) => {
-                    let selection_rect = egui::Rect::from_two_pos(p1, p2);
-                    let dim = egui::Color32::from_black_alpha(160);
-                    // Top
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, selection_rect.min.y)),
-                        0.0, dim,
-                    );
-                    // Bottom
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.max.y), screen_rect.max),
-                        0.0, dim,
-                    );
-                    // Left
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.min.y), egui::pos2(selection_rect.min.x, selection_rect.max.y)),
-                        0.0, dim,
-                    );
-                    // Right
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(egui::pos2(selection_rect.max.x, selection_rect.min.y), egui::pos2(screen_rect.max.x, selection_rect.max.y)),
-                        0.0, dim,
-                    );
-                    painter.rect_stroke(
-                        selection_rect,
-                        0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 180, 255)),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-                _ => {
-                    painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(160));
-                }
-            }
+        // Cancel on Escape or right-click
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.secondary_pressed()) {
+            self.overlay_active.store(false, Ordering::Relaxed);
+            self.start_pos = None;
+            self.current_pos = None;
+            self.was_active = false;
+            self.hide_overlay(ctx);
+            return;
+        }
 
-            // Handle mouse input
-            let pointer = ctx.input(|i| i.pointer.clone());
-            if pointer.primary_pressed() {
-                self.start_pos = pointer.interact_pos();
-            }
-            if pointer.primary_down() {
-                self.current_pos = pointer.interact_pos();
-            }
-            if pointer.primary_released() && self.start_pos.is_some() && self.current_pos.is_some() {
-                let p1 = self.start_pos.unwrap();
-                let p2 = self.current_pos.unwrap();
+        // Draw dim overlay
+        match (self.start_pos, self.current_pos) {
+            (Some(p1), Some(p2)) => {
                 let selection_rect = egui::Rect::from_two_pos(p1, p2);
+                let dim = egui::Color32::from_black_alpha(160);
+                // Top
+                painter.rect_filled(
+                    egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, selection_rect.min.y)),
+                    0.0, dim,
+                );
+                // Bottom
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.max.y), screen_rect.max),
+                    0.0, dim,
+                );
+                // Left
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(screen_rect.min.x, selection_rect.min.y), egui::pos2(selection_rect.min.x, selection_rect.max.y)),
+                    0.0, dim,
+                );
+                // Right
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(selection_rect.max.x, selection_rect.min.y), egui::pos2(screen_rect.max.x, selection_rect.max.y)),
+                    0.0, dim,
+                );
+                painter.rect_stroke(
+                    selection_rect,
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 180, 255)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            _ => {
+                painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(160));
+            }
+        }
 
-                self.overlay_active.store(false, Ordering::Relaxed);
-                self.start_pos = None;
-                self.current_pos = None;
-                self.was_active = false;
+        // Handle mouse input
+        let pointer = ctx.input(|i| i.pointer.clone());
+        if pointer.primary_pressed() {
+            self.start_pos = pointer.interact_pos();
+        }
+        if pointer.primary_down() {
+            self.current_pos = pointer.interact_pos();
+        }
+        if pointer.primary_released() && self.start_pos.is_some() && self.current_pos.is_some() {
+            let p1 = self.start_pos.unwrap();
+            let p2 = self.current_pos.unwrap();
+            let selection_rect = egui::Rect::from_two_pos(p1, p2);
 
-                // Re-enable click-through
-                #[cfg(target_os = "windows")]
-                if let Some(hwnd) = self.hwnd {
-                    unsafe { win32::set_click_through(hwnd, true); }
-                }
+            self.overlay_active.store(false, Ordering::Relaxed);
+            self.start_pos = None;
+            self.current_pos = None;
+            self.was_active = false;
 
-                let scale_factor = ctx.pixels_per_point();
-                let ox = self.window_offset_x;
-                let oy = self.window_offset_y;
-                std::thread::spawn(move || {
-                    if let Ok(image) = capture::capture_region(selection_rect, scale_factor, ox, oy) {
-                        let processed = preprocessing::preprocess(image);
-                        if let Ok(text) = ocr::recognize(&processed, "eng+srp_latn", 6) {
-                            if !text.trim().is_empty() {
-                                let _ = clipboard::copy_to_clipboard(&text);
-                                notification::notify_success();
-                            }
+            // Hide the window immediately
+            self.hide_overlay(ctx);
+
+            let scale_factor = ctx.pixels_per_point();
+            let ox = self.window_offset_x;
+            let oy = self.window_offset_y;
+            std::thread::spawn(move || {
+                // Small delay to let the window fully hide before capturing
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(image) = capture::capture_region(selection_rect, scale_factor, ox, oy) {
+                    let processed = preprocessing::preprocess(image);
+                    if let Ok(text) = ocr::recognize(&processed, "eng+srp_latn", 6) {
+                        if !text.trim().is_empty() {
+                            let _ = clipboard::copy_to_clipboard(&text);
+                            notification::notify_success();
                         }
                     }
-                });
-            }
+                }
+            });
         }
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // Span all monitors
-    let (total_x, total_y, total_w, total_h) = if let Ok(monitors) = xcap::Monitor::all() {
-        let mut min_x = i32::MAX;
-        let mut min_y = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut max_y = i32::MIN;
-        for m in &monitors {
-            min_x = min_x.min(m.x());
-            min_y = min_y.min(m.y());
-            max_x = max_x.max(m.x() + m.width() as i32);
-            max_y = max_y.max(m.y() + m.height() as i32);
-        }
-        if min_x < i32::MAX {
-            (min_x as f32, min_y as f32, (max_x - min_x) as f32, (max_y - min_y) as f32)
-        } else {
-            (0.0, 0.0, 1920.0, 1080.0)
-        }
-    } else {
-        (0.0, 0.0, 1920.0, 1080.0)
-    };
-
+    // Start with a small initial size — will be resized when overlay activates.
+    // The window is hidden immediately on first frame anyway.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_position(egui::pos2(total_x, total_y))
-            .with_inner_size(egui::vec2(total_w, total_h))
+            .with_inner_size(egui::vec2(1.0, 1.0))
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
