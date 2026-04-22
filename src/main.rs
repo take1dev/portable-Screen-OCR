@@ -81,6 +81,7 @@ impl ScreenOcrApp {
                         std::process::exit(0);
                     } else if event.id() == &tray_icon::menu::MenuId::new("change_shortcut") {
                         settings.store(true, Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.request_repaint();
                     }
                 }
@@ -123,7 +124,12 @@ impl ScreenOcrApp {
     // ── Window helpers ────────────────────────────────────────────────────
 
     fn hide_overlay(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Instead of making the window completely invisible (which causes Winit
+        // to aggressively suspend the event loop on Windows), we teleport it
+        // off-screen. This guarantees it can always wake up to custom events
+        // and request_repaint calls from background threads.
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(100.0, 100.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-20000.0, -20000.0)));
         self.frozen_texture = None;
     }
 
@@ -464,12 +470,12 @@ impl eframe::App for ScreenOcrApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(egui::vec2(1.0, 1.0))
+            .with_inner_size(egui::vec2(100.0, 100.0))
+            .with_position(egui::pos2(-20000.0, -20000.0)) // Start immediately off-screen!
             .with_decorations(false)
             .with_transparent(false) // No DWM transparency needed, image is opaque!
             .with_always_on_top()
-            .with_taskbar(false)
-            .with_visible(false), // Start immediately hidden
+            .with_taskbar(false),
         ..Default::default()
     };
 
