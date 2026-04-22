@@ -467,7 +467,44 @@ impl eframe::App for ScreenOcrApp {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
+fn ensure_single_instance() -> Result<(), &'static str> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn CreateMutexW(
+            lpMutexAttributes: *mut std::ffi::c_void,
+            bInitialOwner: i32,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+
+    let mut name: Vec<u16> = OsStr::new("Global\\PortableScreenOcrSingleInstanceMutex")
+        .encode_wide()
+        .collect();
+    name.push(0);
+
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if handle.is_null() {
+            return Err("Failed to create single instance mutex");
+        }
+        if GetLastError() == 183 { // ERROR_ALREADY_EXISTS
+            return Err("Another instance is already running.");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    if ensure_single_instance().is_err() {
+        // Silently exit if already running
+        std::process::exit(0);
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(100.0, 100.0))
