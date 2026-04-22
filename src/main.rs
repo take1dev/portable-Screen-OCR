@@ -88,7 +88,7 @@ impl ScreenOcrApp {
                     }
                 }
                 while let Ok(ev) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
-                    if ev.state == global_hotkey::HotKeyState::Released
+                    if ev.state == global_hotkey::HotKeyState::Pressed
                         && !overlay.load(Ordering::Relaxed)
                     {
                         overlay.store(true, Ordering::Relaxed);
